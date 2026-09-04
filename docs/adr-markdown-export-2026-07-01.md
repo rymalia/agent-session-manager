@@ -455,3 +455,30 @@ Each ADR is **Decision / Why / Consequence** and carries an explicit status.
   future hermetic fixture that asserts an exact rendered timestamp must pin TZ
   the same way. If `/replay` later localizes upstream, re-sync and drop the
   divergence note.
+
+## ADR-0019 — Codex prompt shape is dual-format (`user_message` and `item_completed/UserMessage`)
+
+**Status:** Accepted (2026-09-04)
+
+- **Context:** Around 2026-08-18 the Codex CLI stopped writing the clean prompt as
+  `event_msg/user_message` and began writing it as
+  `event_msg/item_completed { item: { type: 'UserMessage', content: [...] } }`.
+  ADR-0005's source split therefore emitted **zero** user turns for every newer
+  session, and the parity check passed vacuously because the Python reference had
+  the identical blind spot. Local corpus: every file before 2026-08-18 carries
+  `user_message`; after it, most carry only `UserMessage` items; no file carries
+  both.
+- **Decision:** One accessor per side — `userPromptFromEvent()` (JS) and
+  `_codex_user_prompt()` (Python) — recognises both shapes and both stay in
+  lockstep. `UserMessage.content` text blocks are concatenated; `image` /
+  `local_image` blocks collapse to the existing `[N image(s) attached]` note;
+  `skill` blocks (resolved `$skill` mentions) are dropped because the mention is
+  already in the text. `response_item` role=user stays dropped for export
+  (ADR-0005 unchanged).
+- **Consequence:** `list()` now prefers the same clean source for card title and
+  user count when a file has one, falling back to the `response_item` prefix
+  heuristic otherwise; the prefix list gained `# AGENTS.md instructions` for that
+  fallback. The smoke test's new fixture asserts the rendered output **contains**
+  the prompts, so a future shape change fails loudly instead of vacuously.
+- **Open:** if a file ever carries both shapes for the same prompt, it would
+  render twice. Not observed in the corpus; revisit if Codex starts double-writing.

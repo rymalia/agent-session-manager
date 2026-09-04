@@ -660,6 +660,95 @@ await acheck('codex export: empty images falls back to local_images', async () =
   }
 });
 
+// (6a) Codex post-2026-08-18 prompt shape (ADR-0019): the user prompt lives in
+// event_msg/item_completed { item: { type: 'UserMessage' } } instead of
+// event_msg/user_message. Golden-diffed against the Python reference (maintainer
+// gate, ADR-0010 — needs the sibling checkout or EXTRACT_PY).
+const CODEX_ITEM_FIXTURE = './fixtures/codex-item-completed-user-message.jsonl';
+const stageCodexFixture = (tempHome, fixture = CODEX_ITEM_FIXTURE, name = 'rollout-fixture.jsonl') => {
+  const staged = path.join(tempHome, '.codex', 'sessions', '2026', '01', '02', name);
+  fs.mkdirSync(path.dirname(staged), { recursive: true });
+  if (typeof fixture === 'string' && fixture.startsWith('./')) {
+    fs.copyFileSync(fileURLToPath(new URL(fixture, import.meta.url)), staged);
+  } else {
+    fs.writeFileSync(staged, fixture);
+  }
+  return staged;
+};
+
+await acheck('codex export: item_completed UserMessage golden diff (ADR-0019)', async () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'asm-codex-parity-'));
+  try {
+    const staged = stageCodexFixture(tempHome);
+    execFileSync(
+      process.execPath,
+      [fileURLToPath(new URL('./export-parity.mjs', import.meta.url)), 'codex', staged],
+      {
+        env: {
+          ...process.env,
+          HOME: tempHome,
+          EXTRACT_PY: process.env.EXTRACT_PY
+            || path.join(os.homedir(), 'projects', 'claude-session-tools', 'plugins', 'session-tools', 'scripts', 'extract-session.py'),
+        },
+        encoding: 'utf8',
+      },
+    );
+  } finally {
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
+// (6a') Hermetic (no Python): the rendered export must CONTAIN the prompts —
+// the original regression passed parity because BOTH sides dropped every user
+// turn — and list() must prefer the clean prompt for the card title, falling
+// back to the response_item prefix heuristic for files without one. Child
+// process because codex.js captures ROOT from os.homedir() at import time.
+await acheck('codex export+list: item_completed UserMessage prompts render (ADR-0019)', async () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'asm-codex-item-'));
+  try {
+    const staged = stageCodexFixture(tempHome);
+    // A second, clean-prompt-less file: only response_item user messages, led by
+    // the 2026-08 AGENTS.md preamble — exercises the fallback path.
+    stageCodexFixture(tempHome, [
+      '{"timestamp":"2026-01-02T05:00:00.000Z","type":"session_meta","payload":{"id":"fixture-codex-fallback","cwd":"/tmp/redacted-project"}}',
+      '{"timestamp":"2026-01-02T05:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp/redacted-project\n\nscaffold"}]}}',
+      '{"timestamp":"2026-01-02T05:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fallback prompt text."}]}}',
+      '{"timestamp":"2026-01-02T05:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}',
+      '',
+    ].join('\n'), 'rollout-fallback.jsonl');
+    const out = JSON.parse(execFileSync(
+      process.execPath,
+      ['--input-type=module', '-e', `
+        const [ref, adapterUrl, exportUrl] = process.argv.slice(1);
+        const { collectEvents, list } = await import(adapterUrl);
+        const { renderMarkdown } = await import(exportUrl);
+        const r = await collectEvents(ref, {});
+        const rows = await list();
+        process.stdout.write(JSON.stringify({
+          md: renderMarkdown(r.events, r.meta, {}),
+          titles: Object.fromEntries(rows.map((x) => [x.id, x.title])),
+        }));
+      `, staged,
+      new URL('../server/sources/codex.js', import.meta.url).href,
+      new URL('../server/export.js', import.meta.url).href],
+      { env: { ...process.env, HOME: tempHome }, encoding: 'utf8' },
+    ));
+    const { md, titles } = out;
+    if (!md.includes('Summarize the README, then $qmd it.')) throw new Error('UserMessage text turn missing from export');
+    if (!md.includes('Now look at these.\n\n[3 image(s) attached]')) throw new Error('UserMessage image/local_image count note missing');
+    if (md.includes('AGENTS.md instructions') || md.includes('<environment_context>')) throw new Error('scaffolding leaked into export');
+    if ((md.match(/Summarize the README/g) || []).length !== 1) throw new Error('prompt duplicated (response_item + item_completed)');
+    if (titles['fixture-codex-item-completed'] !== 'Summarize the README, then $qmd it.') {
+      throw new Error(`list() title should come from the clean prompt, got ${JSON.stringify(titles['fixture-codex-item-completed'])}`);
+    }
+    if (titles['fixture-codex-fallback'] !== 'Fallback prompt text.') {
+      throw new Error(`list() fallback should skip the AGENTS.md preamble, got ${JSON.stringify(titles['fixture-codex-fallback'])}`);
+    }
+  } finally {
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
 // (6b) Claude live-main index enrichment (ADR-0015): a synthetic main
 // transcript staged BESIDE an overlapping sessions-index.json — the fixture
 // ADR-0015 requires. Golden-diffed against the Python reference across the

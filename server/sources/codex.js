@@ -75,6 +75,12 @@ async function readSession(file, { wantMessages = false, lastN = 30 } = {}) {
   });
   let id = null, cwd = null, gitBranch = null, firstTs = null, lastTs = null, firstUserText = '';
   let userCount = 0, assistantCount = 0;
+  // ADR-0005/ADR-0019: the clean human-typed prompt lives in event_msg
+  // (user_message pre 2026-08-18, item_completed/UserMessage after). When a
+  // file has them they win for title/count; the response_item heuristic below
+  // is the fallback for files that don't (scaffolding prefixes keep growing —
+  // `<recommended_plugins>`, `<skill>` — and are never a closed list).
+  let cleanUserCount = 0, cleanFirstUserText = '';
   // Context health: model comes from session_meta / turn_context (latest wins);
   // used/window come from the LAST token_count event (last_token_usage is the
   // most recent request's real footprint — the resume-relevant number).
@@ -120,6 +126,14 @@ async function readSession(file, { wantMessages = false, lastN = 30 } = {}) {
       }
       continue;
     }
+    if (o.type === 'event_msg') {
+      const prompt = userPromptFromEvent(p);
+      if (prompt && prompt.trim()) {
+        cleanUserCount++;
+        if (!cleanFirstUserText) cleanFirstUserText = prompt;
+      }
+      continue;
+    }
     if (o.type !== 'response_item') continue;
 
     if (p.type === 'message') {
@@ -128,8 +142,7 @@ async function readSession(file, { wantMessages = false, lastN = 30 } = {}) {
       if (role === 'user') {
         // Codex prepends scaffolding user messages (environment context, user
         // instructions) before the real prompt — skip them for title/count.
-        const head = text.trimStart();
-        if (head.startsWith('<environment_context') || head.startsWith('<user_instructions')) continue;
+        if (isScaffolding(text)) continue;
         userCount++;
         if (!firstUserText && text) firstUserText = text;
         if (messages) messages.push({ role: 'user', text, ts: o.timestamp || null });
@@ -149,6 +162,7 @@ async function readSession(file, { wantMessages = false, lastN = 30 } = {}) {
       messages.push({ role: 'tool', text: toolResultLine(out), ts: o.timestamp || null });
     }
   }
+  if (cleanUserCount) { userCount = cleanUserCount; firstUserText = cleanFirstUserText; }
   const contextUsage = ctxUsed != null
     ? finalizeContextUsage({
         usedTokens: ctxUsed, windowTokens: ctxWindow, model: ctxModel,
@@ -261,6 +275,50 @@ function codexOutputText(output) {
 
 // `opts` accepted for registry-signature parity but intentionally unused — like
 // load_codex_events(), conversion keeps every event; filtering is render-time.
+// Codex prepends harness scaffolding as `response_item` user messages before
+// the real prompt (environment context, user instructions, and — since the
+// 2026-08 CLI — the AGENTS.md preamble). Skip them for title/count.
+function isScaffolding(text) {
+  const head = (text || '').trimStart();
+  return head.startsWith('<environment_context')
+    || head.startsWith('<user_instructions')
+    || head.startsWith('# AGENTS.md instructions')
+    || head.startsWith('<recommended_plugins>');
+}
+
+// The human-typed prompt from an `event_msg` payload, in either on-disk shape,
+// or null when the payload is not a user prompt. Image attachments (any
+// shape) collapse to a "[N image(s) attached]" note, matching the reference
+// renderer. Mirrors `_codex_user_prompt` in session-tools' extract-session.py —
+// keep the two in lockstep or the parity check fails.
+export function userPromptFromEvent(p) {
+  if (!p || typeof p !== 'object') return null;
+  let text = '';
+  let imageCount = 0;
+  if (p.type === 'user_message') {
+    text = p.message || '';
+    // Python reference: `images or local_images` — an EMPTY images array falls
+    // through to local_images.
+    const imgs = (Array.isArray(p.images) && p.images.length ? p.images : p.local_images) || [];
+    imageCount = imgs.length;
+  } else if (p.type === 'item_completed') {
+    const item = p.item;
+    if (!item || typeof item !== 'object' || item.type !== 'UserMessage') return null;
+    const blocks = (Array.isArray(item.content) ? item.content : []).filter((b) => b && typeof b === 'object');
+    text = blocks.filter((b) => b.type === 'text').map((b) => b.text || '').join('');
+    // `skill` blocks are the resolved `$skill` mentions; the mention itself is
+    // already in the text, so they are dropped rather than rendered twice.
+    imageCount = blocks.filter((b) => b.type === 'image' || b.type === 'local_image').length;
+  } else {
+    return null;
+  }
+  if (imageCount) {
+    const note = `[${imageCount} image(s) attached]`;
+    text = text.trim() ? `${text}\n\n${note}` : note;
+  }
+  return text;
+}
+
 export async function collectEvents(ref, _opts = {}) {
   const resolved = path.resolve(ref);
   if (!isInside(resolved, ROOT)) throw new Error('forbidden');
@@ -297,17 +355,12 @@ export async function collectEvents(ref, _opts = {}) {
     }
 
     if (etype === 'event_msg') {
-      // The clean, user-typed prompt. Other event_msg subtypes duplicate
-      // response_items or are bookkeeping — skip.
-      if (p.type === 'user_message') {
-        let text = p.message || '';
-        const imgs = (Array.isArray(p.images) && p.images.length ? p.images : p.local_images) || [];
-        if (imgs.length) {
-          const note = `[${imgs.length} image(s) attached]`;
-          text = text.trim() ? `${text}\n\n${note}` : note;
-        }
-        if (text.trim()) emit('user', ts, [{ kind: 'text', text }]);
-      }
+      // The clean, user-typed prompt. Two on-disk shapes (ADR-0019):
+      //   pre  2026-08-18: event_msg/user_message      { message, images|local_images }
+      //   post 2026-08-18: event_msg/item_completed    { item: { type: 'UserMessage', content: [...] } }
+      // Other event_msg subtypes duplicate response_items or are bookkeeping — skip.
+      const prompt = userPromptFromEvent(p);
+      if (prompt && prompt.trim()) emit('user', ts, [{ kind: 'text', text: prompt }]);
       continue;
     }
 
