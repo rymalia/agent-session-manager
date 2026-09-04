@@ -1,5 +1,5 @@
 {
-  "name": "AI Session Manager",
+  "name": "Agent Session Manager",
   "short_name": "Sessions",
   "description": "Browse, search, and resume your local AI coding CLI sessions (Claude Code, Codex, Grok, opencode, Cursor, and more) in one place.",
   "start_url": "/",

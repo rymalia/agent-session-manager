@@ -1,5 +1,5 @@
 {
-  "name": "ai-session-manager",
+  "name": "agent-session-manager",
   "private": true,
   "version": "1.0.0",
   "description": "Local viewer for your AI coding CLI conversations — Claude Code, Codex, Grok, opencode, Cursor, Gemini CLI, Copilot CLI, Goose, Droid, Kimi Code, and Antigravity CLI in one searchable list. Nothing leaves your machine.",
@@ -7,7 +7,7 @@
   "author": "Daniel Farina",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/daniel-farina/ai-session-manager.git"
+    "url": "git+https://github.com/rymalia/agent-session-manager.git"
   },
   "type": "module",
   "engines": {

@@ -1,4 +1,4 @@
-# AI Session Manager
+# Agent Session Manager
 
 A small Vite + React app that lists your local AI-coding-CLI conversations
 across **multiple tools**, lets you search/filter them, preview the last 30
@@ -130,7 +130,7 @@ data yet, the data-dependent checks are skipped.
 With [pm2](https://pm2.keymetrics.io/):
 
 ```bash
-pm2 start npm --name ai-session-manager --cwd /path/to/this/repo -- run dev
+pm2 start npm --name agent-session-manager --cwd /path/to/this/repo -- run dev
 pm2 save
 pm2 startup   # follow the printed instructions for your OS
 ```

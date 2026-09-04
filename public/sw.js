@@ -1,4 +1,4 @@
-/* Service worker for the "AI Session Manager" PWA.
+/* Service worker for the "Agent Session Manager" PWA.
  *
  * Strategy:
  *  - Precache a minimal app shell on install.
@@ -13,9 +13,9 @@
  * Service Workers, or call navigator.serviceWorker.getRegistrations().
  */
 
-const VERSION = 'v2';
-const CACHE_NAME = `ai-session-manager-${VERSION}`;
-const API_CACHE_NAME = `ai-session-manager-api-${VERSION}`;
+const VERSION = 'v3';
+const CACHE_NAME = `agent-session-manager-${VERSION}`;
+const API_CACHE_NAME = `agent-session-manager-api-${VERSION}`;
 
 // App shell. Vite serves index.html at '/', so caching '/' covers the shell.
 const APP_SHELL = [
