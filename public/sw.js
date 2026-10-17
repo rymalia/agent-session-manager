@@ -13,7 +13,7 @@
  * Service Workers, or call navigator.serviceWorker.getRegistrations().
  */
 
-const VERSION = 'v3';
+const VERSION = 'v4';
 const CACHE_NAME = `agent-session-manager-${VERSION}`;
 const API_CACHE_NAME = `agent-session-manager-api-${VERSION}`;
 

@@ -30,7 +30,6 @@ body {
   top: 0;
   background: color-mix(in srgb, var(--bg) 82%, transparent);
   backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
   padding: 16px 0 12px;
   border-bottom: 1px solid var(--border);
   z-index: 10;
