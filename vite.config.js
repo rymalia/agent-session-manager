@@ -7,6 +7,27 @@ import { openPath } from './server/open.js';
 import { getAgents, openAgentTerminal, updateAgent } from './server/agents.js';
 import { searchContent, warmIndex } from './server/search.js';
 
+// Is this a request some OTHER site's page made to our legitimate localhost origin?
+// Vite already rejects foreign Host headers (DNS rebinding), but a cross-site page
+// can still fire `<img src="http://localhost:5191/api/agents/update?id=…">` with a
+// valid Host — CORS only hides the response, it doesn't stop the side effect. And
+// Vite's default CORS trusts ANY loopback origin, so a page on another local dev
+// server (localhost:3000) could even read transcripts. Hence: same-origin only.
+// `none` = typed URL / bookmark (user intent). Neither header present = a non-browser
+// client (curl, the smoke test), which is not a cross-site vector, so it passes.
+export function isCrossSiteRequest(headers = {}, scheme = 'http:') {
+  const site = headers['sec-fetch-site'];
+  if (site && site !== 'same-origin' && site !== 'none') return true;
+  const origin = headers.origin;
+  if (origin) {
+    try {
+      const o = new URL(origin);
+      if (o.protocol !== scheme || o.host !== headers.host) return true;
+    } catch { return true; } // Origin: null (sandboxed iframe, file://) or garbage
+  }
+  return false;
+}
+
 // API that reads local transcripts from every supported AI coding tool and
 // serves a unified list. Registered on BOTH the dev server and the preview
 // server, so a built `dist/` is fully functional via `npm run preview`.
@@ -17,6 +38,12 @@ export async function apiMiddleware(req, res, next) {
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify(body));
   };
+
+  const scheme = req.socket?.encrypted ? 'https:' : 'http:';
+  if (url.pathname.startsWith('/api/') && isCrossSiteRequest(req.headers, scheme)) {
+    res.setHeader('Cache-Control', 'no-store');
+    return json(403, { error: 'cross-site request rejected' });
+  }
 
   if (url.pathname === '/api/sources') {
     const caps = new Set(exportCapableSources());

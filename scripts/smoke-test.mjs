@@ -389,11 +389,52 @@ function mockRes() {
     end(b) { this.ended = true; if (b != null) this.body = String(b); },
   };
 }
-async function callApi(pathname) {
+async function callApi(pathname, headers) {
   const res = mockRes();
-  await apiMiddleware({ url: pathname, method: 'GET' }, res, () => { res.nextCalled = true; });
+  await apiMiddleware({ url: pathname, method: 'GET', headers }, res, () => { res.nextCalled = true; });
   return res;
 }
+
+// Same-origin guard: a cross-site page must not reach ANY /api route — neither the
+// side-effecting GETs (open / agents/open / agents/update) nor the transcript reads.
+// Rejected cases target agents/update with an unknown id: if the guard ever lets one
+// through, the handler answers 400 (unknown id) instead of 403 — no real side effect.
+const HOST = 'localhost:5191';
+const UPDATE = '/api/agents/update?id=__asm_smoke_no_such_agent__';
+for (const [label, headers] of [
+  ['Sec-Fetch-Site: cross-site', { host: HOST, 'sec-fetch-site': 'cross-site' }],
+  ['Sec-Fetch-Site: same-site (other localhost port)', { host: HOST, 'sec-fetch-site': 'same-site' }],
+  ['foreign Origin, no Sec-Fetch-Site', { host: HOST, origin: 'https://evil.example' }],
+  ['loopback Origin on another port', { host: HOST, origin: 'http://localhost:3000' }],
+  ['Origin: null', { host: HOST, origin: 'null' }],
+  ['same host but https Origin (different origin)', { host: HOST, origin: `https://${HOST}` }],
+]) {
+  await acheck(`same-origin guard: ${label} → 403`, async () => {
+    const res = await callApi(UPDATE, headers);
+    if (res.statusCode !== 403) throw new Error(`expected 403, got ${res.statusCode}`);
+    if (res.getHeader('cache-control') !== 'no-store') throw new Error('missing Cache-Control: no-store');
+  });
+}
+for (const [label, headers] of [
+  ['same-origin fetch', { host: HOST, 'sec-fetch-site': 'same-origin' }],
+  ['same-origin with matching Origin', { host: HOST, 'sec-fetch-site': 'same-origin', origin: `http://${HOST}` }],
+  ['typed URL (Sec-Fetch-Site: none)', { host: HOST, 'sec-fetch-site': 'none' }],
+  ['no browser headers (curl)', { host: HOST }],
+]) {
+  await acheck(`same-origin guard: ${label} passes`, async () => {
+    const res = await callApi('/api/sources', headers);
+    if (res.statusCode !== 200) throw new Error(`expected 200, got ${res.statusCode}`);
+  });
+}
+await acheck('same-origin guard: transcript reads are guarded too (loopback page on another port)', async () => {
+  const res = await callApi('/api/conversations', { host: HOST, 'sec-fetch-site': 'same-site' });
+  if (res.statusCode !== 403) throw new Error(`expected 403, got ${res.statusCode}`);
+  if (res.body.includes('"source"')) throw new Error('rejected response leaked conversation data');
+});
+await acheck('same-origin guard: non-/api paths are untouched', async () => {
+  const res = await callApi('/src/main.jsx', { host: HOST, 'sec-fetch-site': 'cross-site' });
+  if (!res.nextCalled) throw new Error('expected next() for a non-API path');
+});
 await acheck('export endpoint: missing source/ref → 400 + no-store', async () => {
   const res = await callApi('/api/export');
   if (res.statusCode !== 400) throw new Error(`expected 400, got ${res.statusCode}`);
