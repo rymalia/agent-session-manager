@@ -183,7 +183,10 @@ async function loadUserPathDirs() {
   let shellDirs = [];
   try {
     const [cmd, args] = userShell(`printf '${PATH_MARKER}%s' "$PATH"`);
-    const { stdout } = await execFileP(cmd, args, { timeout: 5000, maxBuffer: 1024 * 1024 });
+    // SIGKILL, not the default SIGTERM: an interactive zsh ignores SIGTERM, so
+    // a shell stuck in an rc file (e.g. no TTY to read from) would outlive its
+    // timeout and hang every caller sharing this read.
+    const { stdout } = await execFileP(cmd, args, { timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
     const i = stdout.lastIndexOf(PATH_MARKER);
     if (i !== -1) {
       shellDirs = stdout.slice(i + PATH_MARKER.length).split('\n')[0].trim().split(path.delimiter);
@@ -492,6 +495,7 @@ async function runUpdate(r, tail) {
     const [cmd, args] = userShell(r.update);
     const { stdout, stderr } = await execFileP(cmd, args, {
       timeout: 120000,
+      killSignal: 'SIGKILL', // interactive zsh ignores SIGTERM (see loadUserPathDirs)
       maxBuffer: 8 * 1024 * 1024,
     });
     const combined = [stdout, stderr].filter(Boolean).join('\n').trim();

@@ -458,8 +458,8 @@ export default function App() {
   // Load + refresh. Refreshes happen silently in the background (the list is
   // replaced in place); the initial load shows skeletons.
   const [refreshing, setRefreshing] = useState(false);
-  // Bumped by the header Refresh so an open Agents panel re-probes too.
-  const [agentsRefreshKey, setAgentsRefreshKey] = useState(0);
+  // Bumped by the header Refresh so open Usage and Agents panels revalidate too.
+  const [panelRefreshKey, setPanelRefreshKey] = useState(0);
   const lastLoadRef = useRef(0);
   const loadConversations = useCallback((silent = false) => {
     if (!silent) setError(null);
@@ -620,7 +620,7 @@ export default function App() {
               className={`stats-toggle refresh-btn ${refreshing ? 'spinning' : ''}`}
               onClick={() => {
                 loadConversations(true);
-                setAgentsRefreshKey((k) => k + 1);
+                setPanelRefreshKey((k) => k + 1);
               }}
               disabled={refreshing}
               title="Refresh conversations"
@@ -722,13 +722,13 @@ export default function App() {
         <section className="dashboard">
           <Metrics convos={convos} meta={meta} />
           {/* Same order as the source chips above. */}
-          <Usage order={sourceCounts.map(([s]) => s)} />
+          <Usage order={sourceCounts.map(([s]) => s)} refreshKey={panelRefreshKey} />
         </section>
       )}
 
       {/* Same order as the source chips above. */}
       {showAgents && (
-        <Agents order={sourceCounts.map(([s]) => s)} counts={sourceCounts} refreshKey={agentsRefreshKey} />
+        <Agents order={sourceCounts.map(([s]) => s)} counts={sourceCounts} refreshKey={panelRefreshKey} />
       )}
 
       <main className="list">

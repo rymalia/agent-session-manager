@@ -2,7 +2,7 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { listConversations, getConversation, SOURCE_META, collectEvents, exportCapableSources, exportCapabilities } from './server/sources/index.js';
 import { renderMarkdown, deriveFlagTokens, deriveContentDisposition, resolveExportOptions } from './server/export.js';
-import { getUsage } from './server/usage.js';
+import { getUsage, warmUsage } from './server/usage.js';
 import { openPath } from './server/open.js';
 import { getAgents, openAgentTerminal, updateAgent, warmAgents } from './server/agents.js';
 import { searchContent, warmIndex } from './server/search.js';
@@ -123,7 +123,7 @@ export async function apiMiddleware(req, res, next) {
   }
 
   if (url.pathname === '/api/usage') {
-    try { json(200, await getUsage()); }
+    try { json(200, await getUsage({ refresh: url.searchParams.get('refresh') === '1' })); }
     catch (e) { json(500, { error: String(e) }); }
     return;
   }
@@ -181,8 +181,8 @@ export async function apiMiddleware(req, res, next) {
 function conversationsApi() {
   return {
     name: 'conversations-api',
-    configureServer(server) { server.middlewares.use(apiMiddleware); warmIndex(); warmAgents(); },
-    configurePreviewServer(server) { server.middlewares.use(apiMiddleware); warmIndex(); warmAgents(); },
+    configureServer(server) { server.middlewares.use(apiMiddleware); warmIndex(); warmAgents(); warmUsage(); },
+    configurePreviewServer(server) { server.middlewares.use(apiMiddleware); warmIndex(); warmAgents(); warmUsage(); },
   };
 }
 

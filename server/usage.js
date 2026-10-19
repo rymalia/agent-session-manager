@@ -4,9 +4,8 @@
 // tokens / cost where it genuinely exists, a remaining-quota snapshot where a
 // tool actually stores one (only codex does), and mark the rest unavailable.
 //
-// Results are cached and only recomputed when the underlying files change
-// (newest mtime across the relevant tree), so repeat calls stay well under a
-// second even though Claude has ~1000 transcripts.
+// Results are served stale-while-revalidate; Claude's per-file summaries make
+// a refresh pay for changed transcripts rather than rereading the whole tree.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -210,67 +209,177 @@ function opencodeUsage() {
 // by decoding the slug — decoding is lossy (every '-' becomes '/'), and a slug
 // cannot distinguish `…/observer-sessions/sub` from `…/observer-sessions-2`.
 // A few files are sampled per directory in case the first has no cwd line.
-function claudeBlockedDirs(files) {
-  const samples = new Map(); // dir -> up to 3 candidate transcripts
-  for (const f of files) {
-    const dir = path.dirname(f);
-    const arr = samples.get(dir);
-    if (!arr) samples.set(dir, [f]);
-    else if (arr.length < 3) arr.push(f);
-  }
-  const blocked = new Set();
-  for (const [dir, sample] of samples) {
-    for (const f of sample) {
-      const cwd = probeJsonl(f, (o) => (o && typeof o.cwd === 'string' ? o.cwd : null));
-      if (!cwd) continue; // try the next sample
-      if (isBlockedPath(cwd)) blocked.add(dir);
-      break; // the first transcript that names a cwd decides the directory
+const claudeFiles = new Map();
+const claudeBlockedDirCache = new Map();
+let claudeBlocklistSig = null;
+
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
     }
-  }
-  return blocked;
+  }));
+  return results;
 }
 
-function claudeUsage() {
-  const root = path.join(HOME, '.claude', 'projects');
-  if (!fs.existsSync(root)) return { source: 'claude', available: false, note: 'No ~/.claude/projects' };
-  const { files, newest } = walk(root, (n) => n.endsWith('.jsonl'));
-  if (!files.length) return { source: 'claude', available: false, note: 'No transcripts found' };
-  return memo('claude', `${newest}:${files.length}:${blocklistSignature()}`, () => {
-    // Blocked projects (B6). Claude writes every transcript into the project
-    // directory named after its cwd, so ONE probe decides a whole directory —
-    // ~100 first-line reads instead of ~10k full reads.
-    const blockedDirs = hasBlocklist() ? claudeBlockedDirs(files) : null;
-    let input = 0, output = 0, cacheRead = 0, cacheCreate = 0, assistantMsgs = 0, transcripts = 0;
-    for (const f of files) {
-      if (blockedDirs && blockedDirs.has(path.dirname(f))) continue;
-      transcripts++;
-      for (const line of readLines(f)) {
-        if (!line || line.indexOf('"usage"') < 0) continue;
-        let o; try { o = JSON.parse(line); } catch { continue; }
-        const u = o && o.message && o.message.usage;
-        if (!u) continue;
-        const b = parseClaudeUsage(u); // shared breakdown primitive (contextUsage.js)
-        input += b.input;
-        output += b.output;
-        cacheRead += b.cacheRead;
-        cacheCreate += b.cacheCreate;
-        assistantMsgs++;
+// Bounded batches keep directory enumeration and stat work off the event loop
+// without flooding the filesystem with thousands of simultaneous operations.
+async function walkClaude(root) {
+  const dirs = [root];
+  const files = [];
+  while (dirs.length) {
+    const batch = dirs.splice(0, 32);
+    const entriesByDir = await mapLimit(batch, 32, async (dir) => {
+      try { return [dir, await fs.promises.readdir(dir, { withFileTypes: true })]; }
+      catch { return [dir, []]; }
+    });
+    for (const [dir, entries] of entriesByDir) {
+      for (const e of entries) {
+        const file = path.join(dir, e.name);
+        if (e.isDirectory()) dirs.push(file);
+        else if (e.name.endsWith('.jsonl')) files.push(file);
       }
     }
-    const total = input + output + cacheRead + cacheCreate;
-    return {
-      source: 'claude',
-      available: true,
-      kind: 'consumed',
-      note: 'No remaining-quota stored locally; totals are all-time across transcripts',
-      metrics: [
-        { key: 'tokens', label: 'Tokens used (all time)', value: total, display: fmtTokens(total),
-          detail: `in ${fmtTokens(input)} · out ${fmtTokens(output)} · cache ${fmtTokens(cacheRead + cacheCreate)}` },
-        { key: 'sessions', label: 'Transcripts', value: transcripts, display: fmtCount(transcripts) },
-        { key: 'messages', label: 'Assistant msgs', value: assistantMsgs, display: fmtCount(assistantMsgs) },
-      ],
-    };
+  }
+  return mapLimit(files, 32, async (file) => {
+    try {
+      const stat = await fs.promises.stat(file);
+      return { file, mtimeMs: stat.mtimeMs, size: stat.size, ctimeMs: stat.ctimeMs };
+    } catch { return { file, mtimeMs: 0, size: 0, ctimeMs: 0 }; }
   });
+}
+
+async function probeClaudeCwd(file) {
+  let handle;
+  try { handle = await fs.promises.open(file, 'r'); } catch { return null; }
+  try {
+    const buf = Buffer.alloc(65536);
+    const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+    if (!bytesRead) return null;
+    for (const line of buf.subarray(0, bytesRead).toString('utf8').split('\n')) {
+      if (!line.trim()) continue;
+      let o; try { o = JSON.parse(line); } catch { continue; }
+      if (o && typeof o.cwd === 'string' && o.cwd) return o.cwd;
+    }
+  } catch { /* unreadable → fail open */ }
+  finally { try { await handle.close(); } catch {} }
+  return null;
+}
+
+async function claudeBlockedDirsAsync(files, signature) {
+  if (claudeBlocklistSig !== signature) {
+    claudeBlockedDirCache.clear();
+    claudeBlocklistSig = signature;
+  }
+  const samples = new Map();
+  for (const sampleFile of files) {
+    const { file } = sampleFile;
+    const dir = path.dirname(file);
+    const arr = samples.get(dir);
+    if (!arr) samples.set(dir, [sampleFile]);
+    else if (arr.length < 3) arr.push(sampleFile);
+  }
+  for (const dir of claudeBlockedDirCache.keys()) {
+    if (!samples.has(dir)) claudeBlockedDirCache.delete(dir);
+  }
+  // A decision is reused only while its sample files are unchanged; a
+  // directory with no recorded cwd yet stays undecided (fail open) and is
+  // re-probed next build.
+  const missing = [];
+  for (const [dir, sample] of samples) {
+    const key = sample.map((f) => `${f.file}:${f.mtimeMs}:${f.size}:${f.ctimeMs}`).join('|');
+    if (claudeBlockedDirCache.get(dir)?.key !== key) missing.push([dir, sample, key]);
+  }
+  await mapLimit(missing, 32, async ([dir, sample, key]) => {
+    claudeBlockedDirCache.delete(dir);
+    for (const { file } of sample) {
+      const cwd = await probeClaudeCwd(file);
+      if (!cwd) continue;
+      claudeBlockedDirCache.set(dir, { key, blocked: isBlockedPath(cwd) });
+      break;
+    }
+  });
+  return new Set([...samples.keys()].filter((dir) => claudeBlockedDirCache.get(dir)?.blocked));
+}
+
+async function summarizeClaudeFile(file) {
+  let input = 0, output = 0, cacheRead = 0, cacheCreate = 0, assistantMsgs = 0;
+  let data;
+  try { data = await fs.promises.readFile(file, 'utf8'); } catch { return { input, output, cacheRead, cacheCreate, assistantMsgs }; }
+  let lines = 0;
+  for (const line of data.split('\n')) {
+    // Yield within large transcripts, even across lines with no usage records.
+    if (++lines % 250 === 0) await new Promise((resolve) => setImmediate(resolve));
+    if (!line || line.indexOf('"usage"') < 0) continue;
+    let o; try { o = JSON.parse(line); } catch { continue; }
+    const u = o && o.message && o.message.usage;
+    if (!u) continue;
+    const b = parseClaudeUsage(u);
+    input += b.input;
+    output += b.output;
+    cacheRead += b.cacheRead;
+    cacheCreate += b.cacheCreate;
+    assistantMsgs++;
+  }
+  return { input, output, cacheRead, cacheCreate, assistantMsgs };
+}
+
+async function claudeUsage() {
+  const root = path.join(HOME, '.claude', 'projects');
+  let rootStat;
+  try { rootStat = await fs.promises.stat(root); } catch {
+    claudeFiles.clear();
+    return { source: 'claude', available: false, note: 'No ~/.claude/projects' };
+  }
+  if (!rootStat.isDirectory()) {
+    claudeFiles.clear();
+    return { source: 'claude', available: false, note: 'No transcripts found' };
+  }
+  const files = await walkClaude(root);
+  const present = new Set(files.map(({ file }) => file));
+  for (const file of claudeFiles.keys()) if (!present.has(file)) claudeFiles.delete(file);
+  if (!files.length) return { source: 'claude', available: false, note: 'No transcripts found' };
+  const sig = blocklistSignature();
+  const filtering = hasBlocklist();
+  const blockedDirs = filtering ? await claudeBlockedDirsAsync(files, sig) : null;
+  const changed = files.filter(({ file, mtimeMs, size, ctimeMs }) => {
+    if (blockedDirs && blockedDirs.has(path.dirname(file))) return false;
+    const hit = claudeFiles.get(file);
+    return !hit || hit.mtimeMs !== mtimeMs || hit.size !== size || hit.ctimeMs !== ctimeMs;
+  });
+  await mapLimit(changed, 8, async ({ file, mtimeMs, size, ctimeMs }) => {
+    const totals = await summarizeClaudeFile(file);
+    claudeFiles.set(file, { mtimeMs, size, ctimeMs, totals });
+  });
+  let input = 0, output = 0, cacheRead = 0, cacheCreate = 0, assistantMsgs = 0, transcripts = 0;
+  for (const { file } of files) {
+    if (blockedDirs && blockedDirs.has(path.dirname(file))) continue;
+    transcripts++;
+    const t = claudeFiles.get(file)?.totals;
+    if (!t) continue;
+    input += t.input;
+    output += t.output;
+    cacheRead += t.cacheRead;
+    cacheCreate += t.cacheCreate;
+    assistantMsgs += t.assistantMsgs;
+  }
+  const total = input + output + cacheRead + cacheCreate;
+  return {
+    source: 'claude',
+    available: true,
+    kind: 'consumed',
+    note: 'No remaining-quota stored locally; totals are all-time across transcripts',
+    metrics: [
+      { key: 'tokens', label: 'Tokens used (all time)', value: total, display: fmtTokens(total),
+        detail: `in ${fmtTokens(input)} · out ${fmtTokens(output)} · cache ${fmtTokens(cacheRead + cacheCreate)}` },
+      { key: 'sessions', label: 'Transcripts', value: transcripts, display: fmtCount(transcripts) },
+      { key: 'messages', label: 'Assistant msgs', value: assistantMsgs, display: fmtCount(assistantMsgs) },
+    ],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -673,14 +782,62 @@ const SOURCES = [
   opencodeUsage, claudeUsage, codexUsage, grokUsage, cursorUsage, geminiUsage, kimiUsage, antigravityUsage,
 ];
 
-export async function getUsage() {
+const USAGE_TTL_MS = 5000;
+let usageSnapshot = null;
+let usageSnapshotAt = 0;
+let usageSnapshotSig = null;
+let inFlightUsage = null;
+let inFlightIsRefresh = false;
+let inFlightSig = null;
+let usageChain = Promise.resolve();
+
+async function buildUsage() {
+  const sig = blocklistSignature();
   const out = [];
   for (const fn of SOURCES) {
-    try { out.push(fn()); }
+    try { out.push(await fn()); }
     catch (e) {
       // Never let one tool take the whole endpoint down.
       out.push({ source: fn.name.replace(/Usage$/, ''), available: false, note: `Error: ${e.message}` });
     }
   }
+  usageSnapshot = out;
+  usageSnapshotAt = Date.now();
+  usageSnapshotSig = sig;
   return out;
+}
+
+function startUsageBuild(refresh) {
+  const p = usageChain.then(buildUsage).finally(() => {
+    if (inFlightUsage === p) inFlightUsage = null;
+  });
+  usageChain = p.catch(() => {});
+  inFlightUsage = p;
+  inFlightIsRefresh = refresh;
+  inFlightSig = blocklistSignature();
+  return p;
+}
+
+export function getUsage({ refresh = false } = {}) {
+  if (refresh) {
+    if (inFlightUsage && inFlightIsRefresh && inFlightSig === blocklistSignature()) return inFlightUsage;
+    return startUsageBuild(true);
+  }
+  // A snapshot built under a different blocklist is never served, even stale:
+  // usage must not disagree with the (already filtered) conversation list.
+  const sig = blocklistSignature();
+  if (usageSnapshot && usageSnapshotSig === sig) {
+    if (Date.now() - usageSnapshotAt >= USAGE_TTL_MS && !inFlightUsage) {
+      startUsageBuild(false).catch(() => {});
+    }
+    return Promise.resolve(usageSnapshot);
+  }
+  if (inFlightUsage && inFlightSig === sig) return inFlightUsage;
+  return startUsageBuild(false);
+}
+
+// Delay startup warming so it does not compete with the transcript body index.
+export function warmUsage() {
+  const timer = setTimeout(() => { getUsage().catch(() => {}); }, 3000);
+  timer.unref?.();
 }

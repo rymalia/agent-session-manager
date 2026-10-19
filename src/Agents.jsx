@@ -192,6 +192,7 @@ let seenRefreshKey = 0;
 // mount load landing after a post-Update re-probe) can't roll data back.
 let requestSeq = 0;
 let cachedSeq = 0;
+let pendingRefresh = null;
 
 // Registry agent ids are the same ids as the conversation sources, so the
 // cards can follow the header chips exactly like the usage cards do. `counts`
@@ -218,11 +219,20 @@ export default function Agents({ order, counts, refreshKey = 0 }) {
     const id = ++requestSeq;
     latest.current = id;
     setLoading(true);
-    fetch('/api/agents' + (refresh ? '?refresh=1' : ''))
-      .then((r) => {
-        if (!r.ok) throw new Error(`agents ${r.status}`);
-        return r.json();
-      })
+    // A plain load joins a pending refresh rather than racing it with an older
+    // answer. Share the parsed body: a Response can only be read once.
+    const request = !refresh && pendingRefresh
+      ? pendingRefresh
+      : fetch('/api/agents' + (refresh ? '?refresh=1' : '')).then((r) => {
+          if (!r.ok) throw new Error(`agents ${r.status}`);
+          return r.json();
+        });
+    if (refresh) {
+      pendingRefresh = request;
+      const clear = () => { if (pendingRefresh === request) pendingRefresh = null; };
+      request.then(clear, clear);
+    }
+    request
       .then((d) => {
         if (d && d.error) throw new Error(String(d.error));
         const list = Array.isArray(d) ? d : [];
