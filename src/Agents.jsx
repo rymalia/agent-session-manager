@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { orderBySource } from './sourceOrder.js';
 import './agents.css';
 
@@ -58,7 +58,7 @@ function OpenTerminalBtn({ id, kind }) {
 }
 
 // Runs the registry update command for this agent and surfaces the output.
-function UpdateBtn({ id, command }) {
+function UpdateBtn({ id, command, onDone }) {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState(null); // { ok, output }
   const [open, setOpen] = useState(false);
@@ -77,6 +77,8 @@ function UpdateBtn({ id, command }) {
       setOpen(true);
     } finally {
       setRunning(false);
+      // Even a failed update may have changed the install; show what's there now.
+      onDone();
     }
   };
 
@@ -115,7 +117,7 @@ function Exists({ ok }) {
   return <span className={`ag-exists ${ok ? 'ag-yes' : 'ag-no'}`}>{ok ? '✓' : '✗'}</span>;
 }
 
-function AgentCard({ a }) {
+function AgentCard({ a, onUpdated }) {
   return (
     <div className={`ag-card ${a.installed ? '' : 'ag-card-off'}`}>
       <div className="ag-card-head">
@@ -171,36 +173,87 @@ function AgentCard({ a }) {
         </div>
       </div>
 
-      {a.updateCommand && a.installed && <UpdateBtn id={a.id} command={a.updateCommand} />}
+      {a.updateCommand && a.installed && <UpdateBtn id={a.id} command={a.updateCommand} onDone={onUpdated} />}
     </div>
   );
 }
 
-// Registry agent ids are the same ids as the conversation sources, so the
-// cards can follow the header chips exactly like the usage cards do.
-export default function Agents({ order }) {
-  const [agents, setAgents] = useState(null);
-  const [error, setError] = useState(null);
+// The panel unmounts whenever it's hidden, so the last payload lives at module
+// scope: reopening renders it immediately and revalidates in the background
+// instead of showing the probing state again. The server caches the expensive
+// parts (login-shell PATH, per-binary version probes), so a revalidate is cheap.
+let lastAgents = null;
+// The header Refresh count this module last acted on, so a press made while
+// the panel was hidden still forces a re-probe on the next open.
+let seenRefreshKey = 0;
+// Request ids are globally increasing. Each panel instance applies only its
+// own newest request to its state; the module cache keeps the newest response
+// from any instance. Either way an older request finishing late (e.g. the
+// mount load landing after a post-Update re-probe) can't roll data back.
+let requestSeq = 0;
+let cachedSeq = 0;
 
+// Registry agent ids are the same ids as the conversation sources, so the
+// cards can follow the header chips exactly like the usage cards do. `counts`
+// is App's [source, n] list — derived from the blocklist-filtered conversation
+// list, so these numbers always agree with the main list. `refreshKey` changes
+// when the user presses the header Refresh, which forces a full re-probe.
+export default function Agents({ order, counts, refreshKey = 0 }) {
+  const [agents, setAgents] = useState(lastAgents);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  // Responses still update the module cache after the panel closes; only the
+  // React state writes are skipped.
+  const mounted = useRef(false);
+  const latest = useRef(0);
   useEffect(() => {
-    let alive = true;
-    fetch('/api/agents')
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const load = useCallback((refresh) => {
+    const id = ++requestSeq;
+    latest.current = id;
+    setLoading(true);
+    fetch('/api/agents' + (refresh ? '?refresh=1' : ''))
       .then((r) => {
         if (!r.ok) throw new Error(`agents ${r.status}`);
         return r.json();
       })
       .then((d) => {
-        if (!alive) return;
-        if (d && d.error) setError(String(d.error));
-        else setAgents(Array.isArray(d) ? d : []);
+        if (d && d.error) throw new Error(String(d.error));
+        const list = Array.isArray(d) ? d : [];
+        if (id > cachedSeq) {
+          cachedSeq = id;
+          lastAgents = list;
+        }
+        if (id === latest.current && mounted.current) {
+          setAgents(list);
+          setError(null);
+        }
       })
       .catch((e) => {
-        if (alive) setError(e.message || 'failed to load');
+        if (id === latest.current && mounted.current) setError(e.message || 'failed to load');
+      })
+      .finally(() => {
+        if (id === latest.current && mounted.current) setLoading(false);
       });
-    return () => {
-      alive = false;
-    };
   }, []);
+
+  useEffect(() => {
+    const force = refreshKey !== seenRefreshKey;
+    seenRefreshKey = refreshKey;
+    load(force);
+  }, [load, refreshKey]);
+
+  const withCounts = useMemo(() => {
+    if (!agents) return null;
+    const byId = new Map(counts);
+    return agents.map((a) => ({ ...a, conversationCount: byId.get(a.id) || 0 }));
+  }, [agents, counts]);
 
   const installedCount = agents ? agents.filter((a) => a.installed).length : 0;
 
@@ -211,17 +264,24 @@ export default function Agents({ order }) {
         {agents && (
           <span className="ag-panel-sub">
             {installedCount} of {agents.length} installed
+            {loading && ' · checking…'}
+            {!loading && error && (
+              <span className="ag-stale" title={error}>
+                {' '}
+                · refresh failed, showing last known
+              </span>
+            )}
           </span>
         )}
       </div>
 
-      {error && <div className="ag-state ag-state-err">Agents unavailable ({error})</div>}
+      {error && !agents && <div className="ag-state ag-state-err">Agents unavailable ({error})</div>}
       {!agents && !error && <div className="ag-state">Probing installed agents…</div>}
 
-      {agents && (
+      {withCounts && (
         <div className="ag-grid">
-          {orderBySource(agents, order, (a) => a.id).map((a) => (
-            <AgentCard key={a.id} a={a} />
+          {orderBySource(withCounts, order, (a) => a.id).map((a) => (
+            <AgentCard key={a.id} a={a} onUpdated={() => load(true)} />
           ))}
         </div>
       )}

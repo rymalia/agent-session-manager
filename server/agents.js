@@ -176,9 +176,9 @@ const PATH_MARKER = '__asm_path__';
 // The PATH the user actually gets in a terminal. The server's own PATH is not
 // enough: it was inherited when the process started, so a tool installed (or a
 // PATH entry added) since launch is invisible until a restart. One shell spawn
-// per request, not one per agent. The command is a constant — nothing is
+// per refresh (see pathCache below), not one per agent. The command is a constant — nothing is
 // interpolated into it — so there is no injection surface here at all.
-async function userPathDirs() {
+async function loadUserPathDirs() {
   const own = (process.env.PATH || '').split(path.delimiter);
   let shellDirs = [];
   try {
@@ -193,7 +193,48 @@ async function userPathDirs() {
   }
   // Union, shell first: a tool the terminal can see should win, but one only
   // the server can see should still be found.
-  return [...new Set([...shellDirs, ...own])].filter(Boolean);
+  return { dirs: [...new Set([...shellDirs, ...own])].filter(Boolean), fromShell: shellDirs.length > 0 };
+}
+
+// The login shell costs ~1s (more when several start at once), and PATH changes
+// rarely, so it's cached and refreshed in the background once stale. A failed
+// shell (fallback to our own PATH) is retried soon rather than kept for minutes.
+// `force` (the panel's explicit refresh, or after an update) re-reads it now.
+//
+// `gen` bumps on every invalidation. A read that started before one may still
+// be in flight; it is not joined by later callers and its result is not
+// stored, so it can never stamp a pre-update PATH with a fresh expiry.
+const PATH_TTL_MS = 5 * 60_000;
+const PATH_RETRY_MS = 10_000;
+const pathCache = { dirs: null, expiresAt: 0, promise: null, promiseGen: -1, gen: 0 };
+
+function invalidatePathDirs() {
+  pathCache.gen++;
+  pathCache.expiresAt = 0;
+}
+
+function refreshPathDirs() {
+  if (pathCache.promise && pathCache.promiseGen === pathCache.gen) return pathCache.promise;
+  const gen = pathCache.gen;
+  const p = loadUserPathDirs()
+    .then(({ dirs, fromShell }) => {
+      if (gen === pathCache.gen) {
+        pathCache.dirs = dirs;
+        pathCache.expiresAt = Date.now() + (fromShell ? PATH_TTL_MS : PATH_RETRY_MS);
+      }
+      return dirs;
+    })
+    .finally(() => { if (pathCache.promise === p) pathCache.promise = null; });
+  pathCache.promise = p;
+  pathCache.promiseGen = gen;
+  return p;
+}
+
+async function userPathDirs({ force = false } = {}) {
+  if (force) invalidatePathDirs();
+  if (force || !pathCache.dirs) return refreshPathDirs();
+  if (Date.now() >= pathCache.expiresAt) refreshPathDirs().catch(() => {});
+  return pathCache.dirs;
 }
 
 // Resolve a binary against `dirs`. Returns absolute path or null. Pure fs, so
@@ -238,6 +279,33 @@ async function probeVersion(binPath, dirs) {
   }
 }
 
+// Version probes are cached against the file they describe. A self-updater
+// either rewrites the binary or repoints a symlink (~/.local/bin/claude →
+// versions/…), and both change realpath/inode/size/mtime, so an unchanged
+// signature means an unchanged version and the subprocess is skipped.
+const versionCache = new Map(); // id → { sig, promise }
+
+function fileSignature(file) {
+  try {
+    const real = fs.realpathSync(file);
+    const st = fs.statSync(real);
+    return [real, st.dev, st.ino, st.size, st.mtimeMs, st.ctimeMs].join(':');
+  } catch {
+    return null;
+  }
+}
+
+function cachedVersion(id, file, probe) {
+  const sig = fileSignature(file);
+  const hit = versionCache.get(id);
+  if (sig && hit && hit.sig === sig) return hit.promise;
+  const promise = probe();
+  // Only a real version is worth keeping: a null may be a timeout under load.
+  promise.then((v) => { if (v == null && versionCache.get(id)?.promise === promise) versionCache.delete(id); });
+  if (sig) versionCache.set(id, { sig, promise });
+  return promise;
+}
+
 // A tool can be installed as a macOS desktop app instead of a CLI on PATH —
 // opencode ships both. Standard bundle locations only; returns the .app path.
 const APP_DIRS = ['/Applications', '~/Applications'];
@@ -268,23 +336,34 @@ async function appVersion(appPath) {
   }
 }
 
-// Best-effort conversation counts per source, derived from the existing
-// conversation registry. Imported lazily so a failure here never breaks the
-// agents endpoint.
-async function conversationCounts() {
-  try {
-    const mod = await import('./sources/index.js');
-    const convos = await mod.listConversations();
-    const counts = {};
-    for (const c of convos) counts[c.source] = (counts[c.source] || 0) + 1;
-    return counts;
-  } catch {
-    return {};
-  }
+// Conversation counts are NOT computed here: the client derives them from the
+// list it already holds, which went through the listConversations() blocklist
+// choke point, so the two can never disagree and this endpoint never waits on
+// a transcript scan (18s+ cold).
+//
+// Concurrent callers share one build; a refresh joins only another refresh
+// (a plain build may predate whatever prompted it). `refresh` re-reads the
+// login-shell PATH;
+// version probes stay keyed on the binary, so they re-run only where it changed.
+let inFlightAgents = null;
+let inFlightIsRefresh = false;
+export function getAgents({ refresh = false } = {}) {
+  if (inFlightAgents && (!refresh || inFlightIsRefresh)) return inFlightAgents;
+  const p = buildAgents(refresh).finally(() => {
+    if (inFlightAgents === p) inFlightAgents = null;
+  });
+  inFlightAgents = p;
+  inFlightIsRefresh = refresh;
+  return p;
 }
 
-export async function getAgents() {
-  const [counts, pathDirs] = await Promise.all([conversationCounts(), userPathDirs()]);
+// Fill the PATH and version caches at server start so the first open is fast.
+export function warmAgents() {
+  getAgents().catch(() => {});
+}
+
+async function buildAgents(refresh) {
+  const pathDirs = await userPathDirs({ force: refresh });
 
   return Promise.all(
     REGISTRY.map(async (r) => {
@@ -295,9 +374,9 @@ export async function getAgents() {
       const kind = binPath ? 'cli' : appPath ? 'app' : null;
       const installed = Boolean(binPath || appPath);
       const version = binPath
-        ? await probeVersion(binPath, pathDirs)
+        ? await cachedVersion(r.id, binPath, () => probeVersion(binPath, pathDirs))
         : appPath
-          ? await appVersion(appPath)
+          ? await cachedVersion(r.id, path.join(appPath, 'Contents', 'Info.plist'), () => appVersion(appPath))
           : null;
 
       const configDirAbs = expand(r.configDir);
@@ -325,7 +404,6 @@ export async function getAgents() {
         // The registry's updater is a CLI subcommand; a desktop build ships its
         // own updater, so offering the command would only produce an error.
         updateCommand: kind === 'app' ? null : r.update,
-        conversationCount: counts[r.id] ?? 0,
       };
     })
   );
@@ -396,6 +474,18 @@ export async function updateAgent(id) {
     return str.length > 4000 ? str.slice(-4000) : str;
   };
 
+  // Whatever the outcome, re-probe this agent next time: an updater can change
+  // the version without the file signature looking different (e.g. an mtime-
+  // preserving copy), and a partial failure may still have changed something.
+  try {
+    return await runUpdate(r, tail);
+  } finally {
+    versionCache.delete(id);
+    invalidatePathDirs();
+  }
+}
+
+async function runUpdate(r, tail) {
   try {
     // Run via the user's shell so PATH (brew/npm/uv/bun) matches their
     // interactive terminal — the dev server's env may be narrower.

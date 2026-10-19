@@ -4,7 +4,7 @@ import { listConversations, getConversation, SOURCE_META, collectEvents, exportC
 import { renderMarkdown, deriveFlagTokens, deriveContentDisposition, resolveExportOptions } from './server/export.js';
 import { getUsage } from './server/usage.js';
 import { openPath } from './server/open.js';
-import { getAgents, openAgentTerminal, updateAgent } from './server/agents.js';
+import { getAgents, openAgentTerminal, updateAgent, warmAgents } from './server/agents.js';
 import { searchContent, warmIndex } from './server/search.js';
 
 // Is this a request some OTHER site's page made to our legitimate localhost origin?
@@ -143,7 +143,7 @@ export async function apiMiddleware(req, res, next) {
   }
 
   if (url.pathname === '/api/agents') {
-    try { json(200, await getAgents()); }
+    try { json(200, await getAgents({ refresh: url.searchParams.get('refresh') === '1' })); }
     catch (e) { json(500, { error: String(e) }); }
     return;
   }
@@ -181,8 +181,8 @@ export async function apiMiddleware(req, res, next) {
 function conversationsApi() {
   return {
     name: 'conversations-api',
-    configureServer(server) { server.middlewares.use(apiMiddleware); warmIndex(); },
-    configurePreviewServer(server) { server.middlewares.use(apiMiddleware); warmIndex(); },
+    configureServer(server) { server.middlewares.use(apiMiddleware); warmIndex(); warmAgents(); },
+    configurePreviewServer(server) { server.middlewares.use(apiMiddleware); warmIndex(); warmAgents(); },
   };
 }
 

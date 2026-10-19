@@ -274,3 +274,6 @@
   color: #f85149;
   border-color: rgba(248, 81, 73, 0.4);
 }
+.ag-stale {
+  color: #f85149;
+}
